@@ -1,0 +1,6 @@
+#!/bin/bash
+#onchange "rm -f saved.bin && g++ -std=c++17 -DNO_BOUNDS_CHECKING -DPROFILING -ffast-math -O3 -larmadillo -o sci sci.cpp && ./sci" sci.cpp
+onchange "g++ -std=c++17 -DNO_BOUNDS_CHECKING -ffast-math -O3 -larmadillo -o sci sci.cpp" sci.cpp
+#onchange "g++ -std=c++17 -g -larmadillo -o sci sci.cpp" sci.cpp
+# -DNO_BOUNDS_CHECKING
+# -DPROFILING
