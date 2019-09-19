@@ -18,3 +18,7 @@ I used (this file)[https://raw.githubusercontent.com/voidah/archive/master/archi
 ### Compiling
 c++ -larmadillo -std=c++17 -ffast-math -O3 -DNO_BOUNDS_CHECKING -o sci sci.cpp
 
+### HPCC
+This is undocumented, so icer had to tell me, load this first:
+ml -* GCC/8.2.0-2.31.1 OpenMPI/3.1.3 Armadillo/8.400.0
+
