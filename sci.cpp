@@ -99,7 +99,11 @@ namespace GLB {
   unsigned int current_generation; // used in main() loop
   int pop_size = 100;
   int G = 40;
-  float genomic_mutation_rate = 0.0005f;
+  float point_mutation_rate = 0.005f;
+  float vector_mutation_rate = 0.0005f;
+  bool use_point_mu = true;
+  bool use_col_mu = true;
+  bool use_row_mu = true;
   bool local_locality_mu = false;
   int developmental_updates = 200;
   // fitness landscape
@@ -163,7 +167,8 @@ struct GenomeChange {
 struct AgentClassConfiguration {
   public:
     int num_genes;
-    float mu;
+    float mu_point;
+    float mu_vector;
 };
 
 // used for specifying in the Agent ctor
@@ -178,7 +183,7 @@ class Agent {
     // must be called before using the class.
     static void configure(const AgentClassConfiguration& config);
     static inline std::default_random_engine mu_generator{};
-    static inline std::binomial_distribution<int> mu_distribution{};
+    static inline std::binomial_distribution<int> mu_point_distribution{}, mu_vector_distribution{};
 
   public:
     float fitness{-1};
@@ -198,6 +203,9 @@ class Agent {
     void initGRN();
     void runGRN(const int& num_updates);
     void developPhenotypeFromGRN();
+    void mutatePointWise();
+    void mutateColWise();
+    void mutateRowWise();
 };
 
 /*
@@ -208,8 +216,8 @@ class Agent {
  */
 void Agent::configure(const AgentClassConfiguration& config) {
   Agent::num_genes = config.num_genes;
-  Agent::mu = config.mu;
-  mu_distribution.param(std::binomial_distribution<int>::param_type(Agent::num_genes*Agent::num_genes, Agent::mu));
+  mu_point_distribution.param(std::binomial_distribution<int>::param_type(Agent::num_genes*Agent::num_genes, config.mu_point));
+  mu_vector_distribution.param(std::binomial_distribution<int>::param_type(Agent::num_genes, config.mu_vector));
 }
 
 Agent::Agent() : Agent(INIT::NONE) { }
@@ -231,21 +239,19 @@ Agent::~Agent() {
   if (phenotype) delete [] phenotype;
 }
 
-void Agent::inheritFrom(const std::shared_ptr<Agent> parent) {
-  genome = parent->genome;
-  ancestor = parent;
+void Agent::mutatePointWise() {
   // determine number of mutations
   // that should happen,
   // and return early if 0.
   // if no mutations, then
   // return early.
-  int num_mutations = Agent::mu_distribution(Agent::mu_generator);
+  int num_mutations = Agent::mu_point_distribution(Agent::mu_generator);
   if (num_mutations == 0) { return; }
   int genome_size = num_genes * num_genes;
   int pos; // flattened matrix index position
   float mutation_value;
   while (num_mutations > 0) {
-    pos = rand() % genome_size;
+    pos = drand() % genome_size;
     if (GLB::local_locality_mu) {
       mutation_value = randf()*0.1f - 0.05f;
       genome(pos) += mutation_value; // local-locality mutation
@@ -264,6 +270,62 @@ void Agent::inheritFrom(const std::shared_ptr<Agent> parent) {
     }
     --num_mutations;
   }
+}
+
+void Agent::mutateColWise() {
+  int num_mutations = Agent::mu_vector_distribution(Agent::mu_generator);
+  if (num_mutations == 0) { return; }
+  int col_size = num_genes;
+  int pos; // flattened matrix index position
+  colvecf col_offset_values(col_size);
+  while (num_mutations > 0) {
+    pos = drand() % col_size;
+    // make random offsets in [-0.1,0.1]
+    fill::random(col_offset_values);
+    col_offset_values -= 0.5;
+    col_offset_values *= 0.2;
+    genome.col(pos) += col_offset_values;
+    // record each change into changeset
+    for (int i=col_size-1; i>=0; --i) {
+      changeset.emplace_back(GenomeChange{
+                             .location = (pos*col_size)+i,
+                             .newvalue = genome(pos*col_size+i)
+                             });
+    }
+    --num_mutations;
+  }
+}
+
+void Agent::mutateRowWise() {
+  int num_mutations = Agent::mu_vector_distribution(Agent::mu_generator);
+  if (num_mutations == 0) { return; }
+  int row_size = num_genes;
+  int pos; // flattened matrix index position
+  rowvecf row_offset_values(row_size);
+  while (num_mutations > 0) {
+    pos = drand() % row_size;
+    // make random offsets in [-0.1,0.1]
+    fill::random(row_offset_values);
+    row_offset_values -= 0.5;
+    row_offset_values *= 0.2;
+    genome.row(pos) += row_offset_values;
+    // record each change into changeset
+    for (int i=row_size-1; i>=0; --i) {
+      changeset.emplace_back(GenomeChange{
+                             .location = (pos*row_size)+i,
+                             .newvalue = genome(pos*row_size+i)
+                             });
+    }
+    --num_mutations;
+  }
+}
+
+void Agent::inheritFrom(const std::shared_ptr<Agent> parent) {
+  genome = parent->genome;
+  ancestor = parent;
+  if (GLB::use_point_mu) mutatePointWise();
+  if (GLB::use_col_mu) mutateColWise();
+  if (GLB::use_row_mu) mutateRowWise();
 }
 
 auto Agent::initGRN() -> void {
@@ -315,7 +377,7 @@ auto Agent::developPhenotypeFromGRN() -> void {
 namespace ENV {
   namespace MAXONES {
     auto evaluate(std::shared_ptr<Agent> agent) -> float {
-      return accu(agent->genome);
+      return accu(clamp(agent->genome,0,1));
     }
   }
   namespace NKTREADMILL {
@@ -564,7 +626,7 @@ namespace LOD {
     deserialize >> ENV::NKTREADMILL::alpha_beta_seed;
     deserialize >> gene_count;
     GLB::G = gene_count;
-    Agent::configure({ .num_genes=GLB::G, .mu=GLB::genomic_mutation_rate/GLB::G });
+    Agent::configure({ .num_genes=GLB::G, .mu_point=GLB::point_mutation_rate/(GLB::G*GLB::G), .mu_vector=GLB::vector_mutation_rate/GLB::G });
     int network_size = gene_count*gene_count;
     lod.emplace_back(std::make_shared<Agent>(INIT::NONE));
     lod.back()->genome.resize(gene_count,gene_count);
@@ -661,7 +723,7 @@ namespace RUN {
     auto seed = getpid(); // TODO change to process ID for HPCC 
     print("rand_seed:",seed);
     srand(seed); dsrand(seed);
-    Agent::configure({ .num_genes=GLB::G, .mu=GLB::genomic_mutation_rate/GLB::G });
+    Agent::configure({ .num_genes=GLB::G, .mu_point=GLB::point_mutation_rate/(GLB::G*GLB::G), .mu_vector=GLB::vector_mutation_rate/GLB::G });
     ENV::NKTREADMILL::init(seed);
 
     // zero out save file
@@ -765,22 +827,29 @@ int main(int argc, char* argv[]) {
   CLI::App app{"Evolvability Science Tool"}; // shrug
   app.require_subcommand(1); // allow only 1 subcommand (evolve, analyze, info)
   CLI::App* sc_evolve = app.add_subcommand("evolve","evolve a population");
+  CLI::App* sc_test = app.add_subcommand("test","evolve a population on Max Ones");
   CLI::App* sc_analyze = app.add_subcommand("analyze","analyze a line of descent");
   CLI::App* sc_info = app.add_subcommand("info","show information about a line of descent");
 
   /* evolve subcommand */
-  sc_evolve->add_option("-p,--popsize",GLB::pop_size,"population size ["+std::to_string(GLB::pop_size)+"]")->check(CLI::Range(0,INT_MAX));
-  sc_evolve->add_option("-N",GLB::N,"NK (N) 'genome' length")->check(CLI::Range(0,INT_MAX))->required();
-  sc_evolve->add_option("-K",GLB::K,"NK (K) 'gene' length")->check(CLI::Range(0,INT_MAX))->required();
-  sc_evolve->add_option("-G",GLB::G,"GRN (G) number of 'genes' (mat GxG)")->check(CLI::Range(0,INT_MAX))->required();
-  sc_evolve->add_option("-d,--dev-update",GLB::developmental_updates,"number of developmental updates ["+std::to_string(GLB::developmental_updates)+"]");
-  sc_evolve->add_option("-r,--rate",GLB::speed_change,"rate of environmental change ["+std::to_string(GLB::speed_change)+"]");
-  sc_evolve->add_option("-g,--gen",GLB::generations_limit,"number of generations ["+std::to_string(GLB::generations_limit)+"]")->check(CLI::Range(0,INT_MAX));
-  sc_evolve->add_option("-s,--screen-update",GLB::screen_update_interval,"stats screen update interval ["+std::to_string(GLB::screen_update_interval)+"]")->check(CLI::Range(0,INT_MAX));
-  sc_evolve->add_option("-l,--lod-update",GLB::lod_save_interval,"lod saving/prune interval ["+std::to_string(GLB::lod_save_interval)+"]")->check(CLI::Range(0,INT_MAX));
-  sc_evolve->add_option("-u,--mu",GLB::genomic_mutation_rate,"genomic mutation rate ["+std::to_string(GLB::genomic_mutation_rate)+"]")->check(CLI::PositiveNumber);
-  sc_evolve->add_flag("--local-mu",GLB::local_locality_mu,"enable local 'point-offset' mutations ["+std::to_string(GLB::local_locality_mu)+"]");
-  sc_evolve->add_option("--save",GLB::savefilename,"file to save lod to [none]");
+  for (auto& sc : {sc_evolve,sc_test}) {
+    sc->add_option("-p,--popsize",GLB::pop_size,"population size ["+std::to_string(GLB::pop_size)+"]")->check(CLI::Range(0,INT_MAX));
+    sc->add_option("-N",GLB::N,"NK (N) 'genome' length")->check(CLI::Range(0,INT_MAX))->required();
+    sc->add_option("-K",GLB::K,"NK (K) 'gene' length")->check(CLI::Range(0,INT_MAX))->required();
+    sc->add_option("-G",GLB::G,"GRN (G) number of 'genes' (mat GxG)")->check(CLI::Range(0,INT_MAX))->required();
+    sc->add_option("-d,--dev-update",GLB::developmental_updates,"number of developmental updates ["+std::to_string(GLB::developmental_updates)+"]");
+    sc->add_option("-r,--rate",GLB::speed_change,"rate of environmental change ["+std::to_string(GLB::speed_change)+"]");
+    sc->add_option("-g,--gen",GLB::generations_limit,"number of generations ["+std::to_string(GLB::generations_limit)+"]")->check(CLI::Range(0,INT_MAX));
+    sc->add_option("-s,--screen-update",GLB::screen_update_interval,"stats screen update interval ["+std::to_string(GLB::screen_update_interval)+"]")->check(CLI::Range(0,INT_MAX));
+    sc->add_option("-l,--lod-update",GLB::lod_save_interval,"lod saving/prune interval ["+std::to_string(GLB::lod_save_interval)+"]")->check(CLI::Range(0,INT_MAX));
+    sc->add_option("--mup",GLB::point_mutation_rate,"genomic point-wise mutation rate ["+std::to_string(GLB::point_mutation_rate)+"]")->check(CLI::Bound(0.0,1.0));
+    sc->add_option("--muv",GLB::vector_mutation_rate,"genomic vector-wise mutation rate ["+std::to_string(GLB::vector_mutation_rate)+"]")->check(CLI::Bound(0.0,1.0));
+    sc->add_flag("--use-point-mu",GLB::use_point_mu,"enable point-wise mutations ["+std::to_string(GLB::use_point_mu)+"]");
+    sc->add_flag("--use-col-mu",GLB::use_col_mu,"enable vector-wise col mutations ["+std::to_string(GLB::use_col_mu)+"]");
+    sc->add_flag("--use-row-mu",GLB::use_row_mu,"enable vector-wise row mutations ["+std::to_string(GLB::use_row_mu)+"]");
+    sc->add_flag("--local-mu",GLB::local_locality_mu,"enable local 'point-offset' mutations ["+std::to_string(GLB::local_locality_mu)+"]");
+    sc->add_option("--save",GLB::savefilename,"file to save lod to [none]");
+  }
 
   /* analyze subcommand */
   sc_analyze->add_option("filename",GLB::loadfilename,"lod file to load from")->check(CLI::ExistingFile);
@@ -822,7 +891,7 @@ int main(int argc, char* argv[]) {
 //  pop_size=100;
 //  speed_change=0.001; // rate of environment change
 //  developmental_updates = 200;
-//  genomic_mutation_rate = 0.0005f;
+//  point_mutation_rate = 0.0005f;
 //  local_locality_mu = false; // true = incremental genomic changes via mutation
 //  savefilename="out.bin"; // non-empty saves
 //
