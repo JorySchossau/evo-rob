@@ -232,9 +232,7 @@ Agent::~Agent() {
 }
 
 void Agent::inheritFrom(const std::shared_ptr<Agent> parent) {
-  START(genome_copy);
   genome = parent->genome;
-  END(genome_copy);
   ancestor = parent;
   // determine number of mutations
   // that should happen,
