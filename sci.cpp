@@ -720,7 +720,7 @@ namespace RUN {
    */
   auto grn_nktreadmill_haploid_evolution(const std::function<float(std::shared_ptr<Agent>)> fitness_fn) {
     // init code
-    auto seed = getpid(); // TODO change to process ID for HPCC 
+    auto seed = getpid();
     print("rand_seed:",seed);
     srand(seed); dsrand(seed);
     Agent::configure({ .num_genes=GLB::G, .mu_point=GLB::point_mutation_rate/(GLB::G*GLB::G), .mu_vector=GLB::vector_mutation_rate/GLB::G });
