@@ -815,6 +815,7 @@ namespace RUN {
       }
 
       // display running progress in intervals
+      if (GLB::current_generation == 0) {print("time","\t","meanW","\t\t","maxW");}
       if ((GLB::current_generation % GLB::screen_update_interval)==0) {meanW /= GLB::pop_size; print(GLB::current_generation,'\t',meanW,'\t',maxW);}
 
       // display histogram
