@@ -14,6 +14,7 @@
 #include <queue>
 #include <fstream> // ifstream, ofstream
 #include <string>
+#include <iterator>
 #include <random>
 
 #ifdef _WIN32
@@ -65,9 +66,6 @@ using std::begin, std::end;
 // set up armadillo lib math experience
 // now we can do linear algebra
 using namespace arma;
-typedef Row<float> rowvecf;  // rowvec is Row<double> but we want floats so here is rowvecf
-typedef Col<float> colvecf;  // colvec is Col<double> but we want floats so here is colvecf
-typedef Mat<float> matf; // mat is Mat<double> but we want floats so here is matf
 
 // set up faster rand fn
 // much faster random num from 0 to 1 than using
@@ -97,6 +95,7 @@ namespace GLB {
   unsigned int generations_limit = 1'000;
   unsigned int lod_save_interval = 1'000;
   unsigned int current_generation; // used in main() loop
+  int seed {-1};
   int pop_size = 100;
   int G = 40;
   float point_mutation_rate = 0.005f;
@@ -106,6 +105,7 @@ namespace GLB {
   bool use_row_mu = true;
   bool local_locality_mu = false;
   int developmental_updates = 200;
+  std::vector<int> hist_gens;
   // fitness landscape
   int N=20;
   int K=1;
@@ -117,6 +117,9 @@ namespace GLB {
   std::vector<int> gen_pick {0,1,-1};
   unsigned int ntrials {500};
   unsigned int maxmutations {5};
+  bool show_fitness {false};
+  bool show_robustness {false};
+  bool show_phenotype {false};
   /* INFO command parameters */
 }
 
@@ -127,28 +130,30 @@ class GRN {
     const static inline float GRN_DAMP {0.1f};
   public:
     int num_genes;
-    matf network;
-    rowvecf state, projected_state;
+    fmat network;
+    frowvec state, projected_state;
     GRN() = delete;
-    GRN(const matf& /*genome*/);
+    GRN(const fmat& /*genome*/);
     void updateNetwork(const int& iterations=1);
 };
 
-GRN::GRN(const matf& matrix) : num_genes(size(matrix)[0]) {
+GRN::GRN(const fmat& matrix) : num_genes(size(matrix)[0]) {
   state.resize(num_genes);
   projected_state.resize(num_genes);
   network = matrix;
   // fill with values of 1/SIZE
-  state = ones<rowvecf>(num_genes) / num_genes;
+  state = ones<frowvec>(num_genes) / num_genes;
   // constrain values and make into unit-vector
   state = clamp(state, 0.0001, 1.0);
   state /= accu(state);
 }
 
 void GRN::updateNetwork(const int& iterations) {
-  projected_state = state * network;
-  projected_state = (2.0f/(exp(-projected_state)+1.0f)) - 1.0f;
-  state -= (state-projected_state) * GRN_DAMP;
+  for (int iteration=iterations-1; iteration>=0; --iteration) {
+    projected_state = state * network;
+    projected_state = (2.0f/(exp(-projected_state)+1.0f)) - 1.0f;
+    state -= (state-projected_state) * GRN_DAMP;
+  }
 }
 
 /** Agent Code **/
@@ -187,8 +192,9 @@ class Agent {
 
   public:
     float fitness{-1};
-    matf genome; // (serialized)
+    fmat genome; // (serialized)
     bool* phenotype {nullptr}; // continuous genome -> continuous grn -> boolean phenotype
+    bool developed {false};
     unsigned int gen_of_evaluation; // (serialized) (needed for reconstructing env::treadmill)
     std::unique_ptr<GRN> grn {nullptr};
     std::shared_ptr<Agent> ancestor {nullptr};
@@ -247,6 +253,7 @@ void Agent::mutatePointWise() {
   // return early.
   int num_mutations = Agent::mu_point_distribution(Agent::mu_generator);
   if (num_mutations == 0) { return; }
+  developed = false;
   int genome_size = num_genes * num_genes;
   int pos; // flattened matrix index position
   float mutation_value;
@@ -275,9 +282,10 @@ void Agent::mutatePointWise() {
 void Agent::mutateColWise() {
   int num_mutations = Agent::mu_vector_distribution(Agent::mu_generator);
   if (num_mutations == 0) { return; }
+  developed = false;
   int col_size = num_genes;
   int pos; // flattened matrix index position
-  colvecf col_offset_values(col_size);
+  fcolvec col_offset_values(col_size);
   while (num_mutations > 0) {
     pos = drand() % col_size;
     // make random offsets in [-0.1,0.1]
@@ -299,9 +307,10 @@ void Agent::mutateColWise() {
 void Agent::mutateRowWise() {
   int num_mutations = Agent::mu_vector_distribution(Agent::mu_generator);
   if (num_mutations == 0) { return; }
+  developed = false;
   int row_size = num_genes;
   int pos; // flattened matrix index position
-  rowvecf row_offset_values(row_size);
+  frowvec row_offset_values(row_size);
   while (num_mutations > 0) {
     pos = drand() % row_size;
     // make random offsets in [-0.1,0.1]
@@ -323,9 +332,14 @@ void Agent::mutateRowWise() {
 void Agent::inheritFrom(const std::shared_ptr<Agent> parent) {
   genome = parent->genome;
   ancestor = parent;
+  developed = true;
   if (GLB::use_point_mu) mutatePointWise();
   if (GLB::use_col_mu) mutateColWise();
   if (GLB::use_row_mu) mutateRowWise();
+  if (developed) {
+    if (not phenotype) { phenotype = new bool[GLB::N]; }
+    for (int i=0; i<GLB::N; i++) phenotype[i] = parent->phenotype[i];
+  }
 }
 
 auto Agent::initGRN() -> void {
@@ -343,20 +357,20 @@ namespace SELECTION {
    * at each generation, inheriting from the previous
    * generation.
    */
-  void complete_roulette(std::vector<std::shared_ptr<Agent>>& oldpop, std::vector<std::shared_ptr<Agent>>& newpop, const colvecf& fitnesses, const float& minW, const float& maxW) {
+  void complete_roulette(std::vector<std::shared_ptr<Agent>>& oldpop, std::vector<std::shared_ptr<Agent>>& newpop, const fcolvec& fitnesses, const float& minW, const float& maxW) {
     int popsize = oldpop.size();
     int parent;
     // if no selection gradient, then pick randomly
     /* [[ unlikely ]] */
     if (minW == maxW) {
       for (int i=0; i<popsize; i++) {
-        parent = rand() % popsize;
+        parent = drand() % popsize;
         newpop.emplace_back( std::make_shared<Agent>(INIT::NONE) );
         newpop.back()->inheritFrom( oldpop[parent] );
       }
     // if selection gradient, then pick fitness proportional (stochastic)
     } else /*(minW != maxW)*/ {
-      colvecf W = (fitnesses - minW) / (maxW - minW);
+      fcolvec W = (fitnesses - minW) / (maxW - minW);
       for (int i=0; i<popsize; i++) {
         do {
           parent = rand() % popsize;
@@ -369,8 +383,8 @@ namespace SELECTION {
 }
 
 auto Agent::developPhenotypeFromGRN() -> void {
-  if (not phenotype) phenotype = new bool[GLB::N];
-  for (int i=0; i<GLB::N; ++i) { phenotype[i] = (grn->state[i]>0.5f); }
+  if (not phenotype) { phenotype = new bool[GLB::N]; }
+  for (int i=0; i<GLB::N; ++i) { phenotype[i] = (grn->state[i]>0.0f); }
 }
 
 /** fitness functions **/
@@ -397,7 +411,7 @@ namespace ENV {
      * tables. Set and store random
      * number seed before this.
      */
-    matf Alphas,Betas;
+    fmat Alphas,Betas;
     unsigned int alpha_beta_seed {0};
     auto init(const unsigned int& new_seed) -> void {
       Alphas.set_size(GLB::N,1<<GLB::K);
@@ -423,22 +437,32 @@ namespace ENV {
       return std::exp(W/float(GLB::N));
     }
 
-    /* findMaxFitness
-     * Enumerates genomes to find
+    /* getMaxFitAgent
+     * Returns max fit ideal organism.
+     * Enumerates genomes to find.
      * fitness peak (for generation 0)
      */
-    auto getMaxFitness() -> float {
+    auto getMaxFitAgent() -> std::shared_ptr<Agent> {
       std::shared_ptr<Agent> A = std::make_shared<Agent>(INIT::NONE);
+      int bestg;
       A->phenotype = new bool[GLB::N];
       A->gen_of_evaluation = 0;
       float globalPeak=0.0f, fitness=0.0f;
       for(int g=0;g<(1<<GLB::N);g++){
         for(int j=0;j<GLB::N;j++) { A->phenotype[j] = (g>>j)&1; }
         fitness = ENV::NKTREADMILL::evaluate(A);
-        if(fitness>globalPeak)
+        if(fitness>globalPeak) {
           globalPeak=fitness;
+          bestg = g;
+        }
       }
-      return globalPeak;
+      // fill in fitness and phenotyp only
+      std::shared_ptr<Agent> bestAgent = std::make_shared<Agent>(INIT::NONE);
+      bestAgent->fitness = globalPeak;
+      bestAgent->phenotype = new bool[GLB::N];
+      bestAgent->gen_of_evaluation = 0;
+      for(int j=0;j<GLB::N;j++) { bestAgent->phenotype[j] = (bestg>>j)&1; }
+      return bestAgent;
     }
   }
 }
@@ -537,6 +561,8 @@ namespace LOD {
     if (outFS.tellp() == 0) {
       serialize << generations_count;
       serialize << ENV::NKTREADMILL::alpha_beta_seed;
+      serialize << GLB::N << GLB::K << GLB::G;
+      serialize << GLB::speed_change; // rate of change
       serialize << Agent::num_genes;
       for (auto& e : mdca->genome) { serialize << e; }
       current = current->progenitor;
@@ -562,6 +588,7 @@ namespace LOD {
       }
       current = current->progenitor;
     }
+    outFS << std::flush;
     outFS.close();
   }
 
@@ -624,6 +651,8 @@ namespace LOD {
     unsigned int space_to_reserve = (GLB::gen_pick.back()-GLB::gen_pick.front())/GLB::gen_pick[1]+1;
     lod.reserve(space_to_reserve);
     deserialize >> ENV::NKTREADMILL::alpha_beta_seed;
+    deserialize >> GLB::N >> GLB::K >> GLB::G;
+    deserialize >> GLB::speed_change; // rate of change
     deserialize >> gene_count;
     GLB::G = gene_count;
     Agent::configure({ .num_genes=GLB::G, .mu_point=GLB::point_mutation_rate/(GLB::G*GLB::G), .mu_vector=GLB::vector_mutation_rate/GLB::G });
@@ -668,6 +697,25 @@ namespace LOD {
 }
 
 namespace ANALYSIS {
+
+  auto inline showWDist(std::vector<std::shared_ptr<Agent>>& pop, const float& minval, const float& maxval, const int& bins) -> void {
+    std::vector<int> dist(bins, 0);
+    for (auto& agent : pop) {
+      ++dist[int(floor(agent->fitness/maxval*(bins-1)))];
+    }
+    std::cout << std::string(bins,'=') << std::endl;
+    int height = int(floor((*std::max_element(begin(pop), end(pop), [&](std::shared_ptr<Agent>& a, std::shared_ptr<Agent>& b){return a->fitness < b->fitness;}))->fitness/maxval*(bins-1)));
+    while (height > 0) {
+      for (int i=0; i<bins; i++) {
+        if (dist[i] >= height) std::cout << '*';
+        else                   std::cout << ' ';
+      }
+      std::cout << std::endl;
+      --height;
+    }
+    std::cout << std::string(bins,'=') << std::endl;
+  }
+
   struct RobustnessConfiguration {
     public:
     const std::shared_ptr<Agent>& agent;
@@ -679,15 +727,15 @@ namespace ANALYSIS {
 
   auto inline getRobustness(const RobustnessConfiguration& cfg) -> float {
     uvec mu_locs;
-    colvecf mu_newvals;
-    colvecf mu_oldvals;
-    matf& matrix = cfg.agent->genome;
+    fcolvec mu_newvals;
+    fcolvec mu_oldvals;
+    fmat& matrix = cfg.agent->genome;
     int genome_size = matrix.n_elem;
     std::shared_ptr<Agent> agent = cfg.agent;
     agent->gen_of_evaluation = cfg.generation;
 
-    colvecf avg_robustness(cfg.maxmutations); // the 'curve' of robustness
-    colvecf w(cfg.ntrials); // filled each detail level
+    fcolvec avg_robustness(cfg.maxmutations); // the 'curve' of robustness
+    fcolvec w(cfg.ntrials); // filled each detail level
     for (int num_mutations=1; num_mutations<=cfg.maxmutations; num_mutations++) {
       mu_locs.set_size(num_mutations);
       mu_newvals.set_size(num_mutations);
@@ -720,7 +768,7 @@ namespace RUN {
    */
   auto grn_nktreadmill_haploid_evolution(const std::function<float(std::shared_ptr<Agent>)> fitness_fn) {
     // init code
-    auto seed = getpid();
+    auto seed = (GLB::seed == -1) ? getpid() : GLB::seed;
     print("rand_seed:",seed);
     srand(seed); dsrand(seed);
     Agent::configure({ .num_genes=GLB::G, .mu_point=GLB::point_mutation_rate/(GLB::G*GLB::G), .mu_vector=GLB::vector_mutation_rate/GLB::G });
@@ -737,18 +785,22 @@ namespace RUN {
     }
 
     std::vector<std::shared_ptr<Agent>> population, newpopulation;
-    colvecf fitnesses(GLB::pop_size);
+    fcolvec fitnesses(GLB::pop_size);
+
     // create population
     for (int i=0; i<GLB::pop_size; i++) population.emplace_back(std::make_shared<Agent>(INIT::RANDOM));
+
     // loop generations
     float minW(FLT_MAX),maxW(FLT_MIN),meanW(0);
     for (GLB::current_generation=0; GLB::current_generation<GLB::generations_limit+1; GLB::current_generation++) {
       // evaluate population
       minW = FLT_MAX; maxW = FLT_MIN; meanW = 0.0f;
       for (int i=0; i<GLB::pop_size; i++) {
-        population[i]->initGRN();
-        population[i]->runGRN(GLB::developmental_updates);
-        population[i]->developPhenotypeFromGRN();
+        if (not population[i]->developed) {
+          population[i]->initGRN();
+          population[i]->runGRN(GLB::developmental_updates);
+          population[i]->developPhenotypeFromGRN();
+        }
         population[i]->gen_of_evaluation = GLB::current_generation;
 
         // fitness functions
@@ -763,7 +815,13 @@ namespace RUN {
       }
 
       // display running progress in intervals
-      if ((GLB::current_generation % GLB::screen_update_interval)==0) {meanW /= GLB::pop_size; print(GLB::current_generation,meanW);}
+      if ((GLB::current_generation % GLB::screen_update_interval)==0) {meanW /= GLB::pop_size; print(GLB::current_generation,'\t',meanW,'\t',maxW);}
+
+      // display histogram
+      if ( (GLB::hist_gens.size()>0) && (GLB::current_generation == GLB::hist_gens[0]) ) {
+        ANALYSIS::showWDist(population,0,1,60);
+        GLB::hist_gens.erase(begin(GLB::hist_gens), begin(GLB::hist_gens)+1);
+      }
 
       // save and prune LOD in intervals
       if (GLB::savefilename.size() > 0) {
@@ -795,15 +853,55 @@ namespace RUN {
     ENV::NKTREADMILL::init(ENV::NKTREADMILL::alpha_beta_seed);
     std::ofstream outFS;
     if (GLB::savefilename.size() > 0) { outFS.open(GLB::savefilename,ios::out|ios::trunc); }
+    
+    // find best agent
+    std::shared_ptr<Agent> best = ENV::NKTREADMILL::getMaxFitAgent();
+    std::cout << "best phenotype: ";
+    for (int i=0; i<GLB::N; i++) std::cout << best->phenotype[i];
+    std::cout << endl;
+
+    // print headers
+    std::cout << "generation"; if (GLB::show_fitness) std::cout << ",fitness,norm_fitness"; if (GLB::show_robustness) std::cout << ",robustness"; if (GLB::show_phenotype) std::cout << ",phenotype";
+    std::cout << std::endl;
+    if (outFS.is_open()) {
+      outFS << "generation"; if (GLB::show_fitness) outFS << ",fitness,norm_fitness"; if (GLB::show_robustness) outFS << ",robustness"; if (GLB::show_phenotype) outFS << ",phenotype";
+      outFS << std::endl;
+    }
     // loop through picked gens
     for (int i=0; i<lod.size(); ++i) {
       // reconstruct genome i
       lod[i]->initGRN();
       lod[i]->runGRN(GLB::developmental_updates);
       lod[i]->developPhenotypeFromGRN();
-      float rmean = ANALYSIS::getRobustness({ .agent=lod[i], .maxmutations=GLB::maxmutations, .ntrials=GLB::ntrials, .generation=lod[i]->gen_of_evaluation, .fitness_fn=fitness_fn });
-      print(lod[i]->gen_of_evaluation,rmean);
-      if (outFS.is_open()) { outFS << lod[i]->gen_of_evaluation << "," << rmean << std::endl; }
+      std::cout << lod[i]->gen_of_evaluation;
+      if (outFS.is_open()) outFS << lod[i]->gen_of_evaluation;
+      // fitness inspection
+      if (GLB::show_fitness) {
+        // fitness functions
+        //fitnesses(i) = ENV::MAXONES::evaluate(population[i]);
+        //fitnesses(i) = ENV::NKTREADMILL::evaluate(population[i]);
+        float w = fitness_fn(lod[i]);
+        std::cout << "," << w << "," << w/best->fitness;
+        if (outFS.is_open()) outFS << "," << w << "," << w/best->fitness;
+      }
+      // robustness inspection
+      if (GLB::show_robustness) {
+        float rmean = ANALYSIS::getRobustness({ .agent=lod[i], .maxmutations=GLB::maxmutations, .ntrials=GLB::ntrials, .generation=lod[i]->gen_of_evaluation, .fitness_fn=fitness_fn });
+        std::cout << "," << rmean;
+        if (outFS.is_open()) outFS << "," << rmean;
+      }
+      // phenotype inspection
+      if (GLB::show_phenotype) {
+        std::cout << ",";
+        if (outFS.is_open()) outFS << ",";
+        for (int n=0; n<GLB::N; n++) {
+          std::cout << lod[i]->phenotype[n];
+          if (outFS.is_open()) outFS << lod[i]->phenotype[n];
+        }
+      }
+      // finish line
+      std::cout << std::endl;
+      if (outFS.is_open()) outFS << std::endl;
     }
     if (outFS.is_open()) outFS.close();
   }
@@ -838,12 +936,14 @@ int main(int argc, char* argv[]) {
     sc->add_option("-K",GLB::K,"NK (K) 'gene' length")->check(CLI::Range(0,INT_MAX))->required();
     sc->add_option("-G",GLB::G,"GRN (G) number of 'genes' (mat GxG)")->check(CLI::Range(0,INT_MAX))->required();
     sc->add_option("-d,--dev-update",GLB::developmental_updates,"number of developmental updates ["+std::to_string(GLB::developmental_updates)+"]");
-    sc->add_option("-r,--rate",GLB::speed_change,"rate of environmental change ["+std::to_string(GLB::speed_change)+"]");
+    sc->add_option("--rate",GLB::speed_change,"rate of environmental change ["+std::to_string(GLB::speed_change)+"]");
     sc->add_option("-g,--gen",GLB::generations_limit,"number of generations ["+std::to_string(GLB::generations_limit)+"]")->check(CLI::Range(0,INT_MAX));
     sc->add_option("-s,--screen-update",GLB::screen_update_interval,"stats screen update interval ["+std::to_string(GLB::screen_update_interval)+"]")->check(CLI::Range(0,INT_MAX));
     sc->add_option("-l,--lod-update",GLB::lod_save_interval,"lod saving/prune interval ["+std::to_string(GLB::lod_save_interval)+"]")->check(CLI::Range(0,INT_MAX));
+    sc->add_option("--hist-gens",GLB::hist_gens,"csv which gens to show hist")->delimiter(',');
     sc->add_option("--mup",GLB::point_mutation_rate,"genomic point-wise mutation rate ["+std::to_string(GLB::point_mutation_rate)+"]")->check(CLI::Bound(0.0,1.0));
     sc->add_option("--muv",GLB::vector_mutation_rate,"genomic vector-wise mutation rate ["+std::to_string(GLB::vector_mutation_rate)+"]")->check(CLI::Bound(0.0,1.0));
+    sc->add_option("--seed",GLB::seed,"set the seed")->check(CLI::Range(0,INT_MAX));
     sc->add_flag("--use-point-mu",GLB::use_point_mu,"enable point-wise mutations ["+std::to_string(GLB::use_point_mu)+"]");
     sc->add_flag("--use-col-mu",GLB::use_col_mu,"enable vector-wise col mutations ["+std::to_string(GLB::use_col_mu)+"]");
     sc->add_flag("--use-row-mu",GLB::use_row_mu,"enable vector-wise row mutations ["+std::to_string(GLB::use_row_mu)+"]");
@@ -857,6 +957,10 @@ int main(int argc, char* argv[]) {
   sc_analyze->add_option("--pick",GLB::gen_pick,"gens to analyze from lod [0,1,-1] [beg,skp,end]")->delimiter(':')->expected(3);
   sc_analyze->add_option("-n,--ntrials",GLB::ntrials,"times to mutate and get fitness per resolution ["+std::to_string(GLB::ntrials)+"]")->check(CLI::PositiveNumber);
   sc_analyze->add_option("-m,--maxmutations",GLB::maxmutations,"starting from 1, up to # of concurrent mutations to investigate ["+std::to_string(GLB::maxmutations)+"]")->check(CLI::PositiveNumber);
+  sc_analyze->add_option("--rate",GLB::speed_change,"rate of environmental change ["+std::to_string(GLB::speed_change)+"]");
+  sc_analyze->add_flag("-w,--fitness",GLB::show_fitness,"enable inspecting the fitness");
+  sc_analyze->add_flag("-p,--phenotype",GLB::show_phenotype,"enable inspecting the phenotype array");
+  sc_analyze->add_flag("-r,--robustness",GLB::show_robustness,"enable inspecting the robustness");
 
   /* info subcommand */
   sc_info->add_option("filename",GLB::loadfilename,"lod file to load from")->check(CLI::ExistingFile);
@@ -869,6 +973,8 @@ int main(int argc, char* argv[]) {
 
   if (sc_evolve->parsed()) {
     RUN::grn_nktreadmill_haploid_evolution(ENV::NKTREADMILL::evaluate);
+  } else if (sc_test->parsed()) {
+    RUN::grn_nktreadmill_haploid_evolution(ENV::MAXONES::evaluate);
   } else if (sc_analyze->parsed()) {
     RUN::analyze(ENV::NKTREADMILL::evaluate);
   } else if (sc_info->parsed()) {
@@ -877,6 +983,33 @@ int main(int argc, char* argv[]) {
 
   return(0);
 }
+
+//int main() {
+//  auto seed = getpid();
+//  srand(seed); dsrand(seed);
+//  Agent::configure({ .num_genes=GLB::G, .mu_point=GLB::point_mutation_rate/(GLB::G*GLB::G), .mu_vector=GLB::vector_mutation_rate/GLB::G });
+//  std::vector<std::shared_ptr<Agent>> pop;
+//  for (int i=0; i<100; i++) { pop.emplace_back(std::make_shared<Agent>(INIT::RANDOM)); }
+//  for (int g=0; g<100; g++) {
+//    auto agent = pop[g];
+//    agent->initGRN();
+//    std::ofstream outFS("states.csv",ios::trunc|ios::out);
+//    std::ostream& out = outFS;
+//    for (int i=0; i<800; i++) {
+//      agent->runGRN(1);
+//      agent->developPhenotypeFromGRN();
+//      if (g > 97) {
+//        for (int n=0; n<GLB::N-1; n++) {
+//          out << agent->grn->state[n] << ",";
+//          std::cout << agent->phenotype[n];
+//        }
+//        out << agent->grn->state[GLB::N-1] << std::endl;
+//        std::cout << std::endl;
+//      }
+//    }
+//  }
+//  return(0);
+//}
 
 /* Arend's script-like main() */
 //int main(int argc, char* argv[]) {
