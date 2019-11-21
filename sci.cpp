@@ -120,6 +120,7 @@ namespace GLB {
   bool show_fitness {false};
   bool show_robustness {false};
   bool show_phenotype {false};
+  bool show_deltaperfect {false}; // num mutations from perfect genotype
   /* INFO command parameters */
 }
 
@@ -442,11 +443,15 @@ namespace ENV {
      * Enumerates genomes to find.
      * fitness peak (for generation 0)
      */
-    auto getMaxFitAgent() -> std::shared_ptr<Agent> {
+    struct MaxFitConfiguration {
+      public:
+        int generation;
+    };
+    auto getMaxFitAgent(const MaxFitConfiguration& cfg) -> std::shared_ptr<Agent> {
       std::shared_ptr<Agent> A = std::make_shared<Agent>(INIT::NONE);
       int bestg;
       A->phenotype = new bool[GLB::N];
-      A->gen_of_evaluation = 0;
+      A->gen_of_evaluation = cfg.generation;
       float globalPeak=0.0f, fitness=0.0f;
       for(int g=0;g<(1<<GLB::N);g++){
         for(int j=0;j<GLB::N;j++) { A->phenotype[j] = (g>>j)&1; }
@@ -856,7 +861,7 @@ namespace RUN {
     if (GLB::savefilename.size() > 0) { outFS.open(GLB::savefilename,ios::out|ios::trunc); }
     
     // find best agent
-    std::shared_ptr<Agent> best = ENV::NKTREADMILL::getMaxFitAgent();
+    std::shared_ptr<Agent> best = ENV::NKTREADMILL::getMaxFitAgent({.generation=0});
     std::cout << "best phenotype: ";
     for (int i=0; i<GLB::N; i++) std::cout << best->phenotype[i];
     std::cout << endl;
@@ -900,9 +905,22 @@ namespace RUN {
           if (outFS.is_open()) outFS << lod[i]->phenotype[n];
         }
       }
+      // delta perfect genotype inspection
+      if (GLB::show_deltaperfect) {
+        std::cout << ",";
+        if (outFS.is_open()) outFS << ",";
+        std::shared_ptr<Agent> perfect;
+        int genomic_differences {0};
+        perfect = ENV::NKTREADMILL::getMaxFitAgent({.generation=lod[i]->gen_of_evaluation});
+        for (int n=0; n<GLB::N; n++) {
+          genomic_differences += int(lod[i]->phenotype[n] != perfect->phenotype[n]);
+        }
+        std::cout << genomic_differences;
+        if (outFS.is_open()) outFS << genomic_differences;
+      }
       // finish line
       std::cout << std::endl;
-      if (outFS.is_open()) outFS << std::endl;
+      if (outFS.is_open()) outFS << std::flush << std::endl;
     }
     if (outFS.is_open()) outFS.close();
   }
@@ -962,6 +980,7 @@ int main(int argc, char* argv[]) {
   sc_analyze->add_flag("-w,--fitness",GLB::show_fitness,"enable inspecting the fitness");
   sc_analyze->add_flag("-p,--phenotype",GLB::show_phenotype,"enable inspecting the phenotype array");
   sc_analyze->add_flag("-r,--robustness",GLB::show_robustness,"enable inspecting the robustness");
+  sc_analyze->add_flag("-d,--deltaperfect",GLB::show_deltaperfect,"enable inspecting the delta from ideal genome");
 
   /* info subcommand */
   sc_info->add_option("filename",GLB::loadfilename,"lod file to load from")->check(CLI::ExistingFile);
